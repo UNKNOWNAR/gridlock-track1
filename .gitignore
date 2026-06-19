@@ -35,7 +35,6 @@ share/python-wheels/
 MANIFEST
 
 # Large data files
-*.csv
 *.json
 *.xlsx
 *.sqlite
