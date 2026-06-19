@@ -6,3 +6,6 @@ folium
 requests
 python-dotenv
 plotly
+fastapi
+uvicorn
+pydantic
