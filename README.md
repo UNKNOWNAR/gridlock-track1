@@ -1,7 +1,18 @@
+---
+title: Btp Traffic Intelligence
+emoji: 🚦
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # BTP Enforcement Intelligence
 **Gridlock 2.0 Hackathon Final Submission (Track 1)**
 
 An AI-driven parking intelligence dashboard for the Bengaluru Traffic Police (ASTraM unit). It processes CCTV/violation data to detect illegal parking hotspots, quantifies their impact on traffic congestion, and generates actionable daily patrol schedules to optimize enforcement.
+
 
 ## 🎯 Core Capabilities
 - **Enforcement Gap Detection:** Flags zones where officers are under-patrolling compared to AI-detected violations.
