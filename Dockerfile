@@ -23,7 +23,6 @@ COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 # Copy the rest of the backend files and directories
 COPY api.py .
-COPY .env .
 COPY modules/ ./modules/
 COPY data/ ./data/
 COPY components/ ./components/
