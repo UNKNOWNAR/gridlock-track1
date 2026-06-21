@@ -43,3 +43,6 @@ data/
 *.zip
 *.tar.gz
 *.tgz
+
+!data/
+!data/violations.csv
