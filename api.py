@@ -1,298 +1,383 @@
+"""
+api.py — FastAPI backend for BTP Enforcement Intelligence
+Serves all data endpoints consumed by the React frontend.
+"""
 import os
 import json
-import pandas as pd
-import numpy as np
+from typing import Optional
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
+import pandas as pd
 
-# Load env variables
-load_dotenv()
-
+# ── Import our analytics modules ─────────────────────────────────────────────
 from modules.data_loader import load_violations
 from modules.violation_decoder import decode_violations
 from modules.clustering import find_hotspots
 from modules.scoring import score_clusters
+from modules.trend_engine import compute_weekly_trends, get_trending_zones
+from modules.patrol_scheduler import generate_patrol_schedule, schedule_summary
 
-app = FastAPI(title="BTP Enforcement Intelligence API")
+load_dotenv()
 
-# Enable CORS for React frontend (port 5173 or * for safety in development)
+app = FastAPI(title="BTP Enforcement Intelligence API", version="2.0.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load data on startup
-DATA_PATH = "data/violations.csv"
+# ── One-time data load on startup ─────────────────────────────────────────────
+print("Loading dataset... (this takes ~20s the first time)")
+_df = load_violations("data/violations.csv")
+_df = decode_violations(_df)
+_df = find_hotspots(_df)
+_cluster_stats = score_clusters(_df)
+_trends = compute_weekly_trends(_df)
+_cluster_stats = get_trending_zones(_cluster_stats, _trends["cluster_trend"])
+_patrol_schedule = generate_patrol_schedule(_cluster_stats)
+print(f"Ready — {len(_df):,} rows, {len(_cluster_stats)} clusters")
 
-# Global data containers
-df_violations = pd.DataFrame()
-df_clusters = pd.DataFrame()
 
-def load_and_process_data():
-    global df_violations, df_clusters
-    if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError(f"Data file {DATA_PATH} not found. Please run the data generator first.")
-    
-    # Load and process using original modules
-    df = load_violations(DATA_PATH)
-    df = decode_violations(df)
-    df = find_hotspots(df)
-    clusters = score_clusters(df)
-    
-    df_violations = df
-    df_clusters = clusters
-    print(f"Data processed successfully. Violations: {len(df_violations)}, Hotspots: {len(df_clusters)}")
+# ── Helper to safely convert NaN to None ─────────────────────────────────────
+def _clean(val):
+    if isinstance(val, float) and pd.isna(val):
+        return None
+    return val
 
-try:
-    load_and_process_data()
-except Exception as e:
-    print(f"Error processing data on startup: {e}")
 
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "records": len(df_violations), "hotspots": len(df_clusters)}
+def _row_to_dict(row: pd.Series) -> dict:
+    return {k: _clean(v) for k, v in row.items()}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ════════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/stats")
 def get_stats():
-    if df_violations.empty:
-        return {"total_cases": 0, "hotspots": 0, "highest_risk_zone": None, "enforcement_gaps": 0}
-    
-    total_cases = len(df_violations)
-    hotspots_count = len(df_clusters)
-    gap_count = int(df_clusters["enforcement_gap_flag"].sum()) if not df_clusters.empty else 0
-    
-    top_zone = None
-    if not df_clusters.empty:
-        top_row = df_clusters.iloc[0]
-        top_zone = {
-            "cluster_id": int(top_row["cluster_id"]),
-            "lat": float(top_row["lat"]),
-            "lon": float(top_row["lon"]),
-            "score": float(top_row["congestion_score"]),
-            "police_station": str(top_row["top_police_station"])
-        }
-        
-    approved_count = int((df_violations["validation_status"] == "approved").sum())
-    rejected_count = int((df_violations["validation_status"] == "rejected").sum())
-    avg_approval_rate = float(approved_count / total_cases) if total_cases > 0 else 0
-    
+    """Global KPIs for the metrics ribbon."""
+    top = _cluster_stats.iloc[0] if not _cluster_stats.empty else None
+    total_delay = float(_cluster_stats["estimated_delay_minutes"].sum()) if not _cluster_stats.empty else 0
     return {
-        "total_cases": total_cases,
-        "approved": approved_count,
-        "rejected": rejected_count,
-        "avg_approval_rate": avg_approval_rate,
-        "hotspots_count": hotspots_count,
-        "enforcement_gaps": gap_count,
-        "highest_risk_zone": top_zone
+        "total_cases": int(len(_df)),
+        "approved": int((_df["validation_status"] == "approved").sum()),
+        "rejected": int((_df["validation_status"] == "rejected").sum()),
+        "avg_approval_rate": float((_df["validation_status"] == "approved").mean()),
+        "hotspots_count": int(len(_cluster_stats)),
+        "enforcement_gaps": int(_cluster_stats["enforcement_gap_flag"].sum()) if not _cluster_stats.empty else 0,
+        "critical_zones": int((_cluster_stats["impact_category"] == "CRITICAL").sum()) if not _cluster_stats.empty else 0,
+        "total_delay_hours": round(total_delay / 60, 1),
+        "unique_junctions": int(_df["junction_label"].nunique()),
+        "highest_risk_zone": {
+            "lat": float(top["lat"]),
+            "lon": float(top["lon"]),
+            "score": float(top["congestion_score"]),
+            "police_station": str(top["top_police_station"]),
+            "impact": str(top["impact_category"]),
+            "delay_min": float(top["estimated_delay_minutes"]),
+        } if top is not None else None,
     }
+
 
 @app.get("/api/hotspots")
 def get_hotspots():
-    if df_clusters.empty:
+    """All cluster stats for map rendering and tables."""
+    if _cluster_stats.empty:
         return []
-    
-    # Return serializable records
-    records = []
-    for _, row in df_clusters.iterrows():
-        records.append({
-            "cluster_id": int(row["cluster_id"]),
-            "violation_count": int(row["violation_count"]),
-            "lat": float(row["lat"]),
-            "lon": float(row["lon"]),
-            "top_violation": str(row["top_violation"]),
-            "avg_vehicle_weight": float(row["avg_vehicle_weight"]),
-            "congestion_score": float(row["congestion_score"]),
-            "approval_rate": float(row["approval_rate"]),
-            "enforcement_gap_flag": bool(row["enforcement_gap_flag"]),
-            "peak_hour": int(row["peak_hour"]),
-            "top_police_station": str(row["top_police_station"])
-        })
-    return records
+    records = _cluster_stats.drop(columns=["vehicle_type_mix"], errors="ignore")
+    out = []
+    for _, row in records.iterrows():
+        d = _row_to_dict(row)
+        out.append(d)
+    return out
+
 
 @app.get("/api/violations")
-def get_violations(status: Optional[str] = "approved"):
-    if df_violations.empty:
-        return []
-    
-    filtered = df_violations
-    if status:
-        filtered = df_violations[df_violations["validation_status"] == status]
-        
-    # Return coordinates, status, and weights for mapping
-    records = []
-    # Drop rows without coords
-    valid_coords = filtered.dropna(subset=["latitude", "longitude"])
-    
-    # Limit number of points sent to map for frontend performance if too many
-    sample_df = valid_coords.head(1000) # Send up to 1000 records
-    
-    for _, row in sample_df.iterrows():
-        records.append({
-            "lat": float(row["latitude"]),
-            "lon": float(row["longitude"]),
-            "status": str(row["validation_status"]),
-            "violation": str(row["primary_violation"]),
-            "vehicle": str(row["vehicle_type"]),
-            "time": row["created_datetime"].isoformat() if hasattr(row["created_datetime"], "isoformat") else str(row["created_datetime"]),
-            "cluster": int(row["cluster"])
-        })
-    return records
+def get_violations(limit: int = 600):
+    """Sample raw violation points for map rendering."""
+    approved = _df[_df["validation_status"] == "approved"].dropna(subset=["latitude", "longitude"])
+    sample = approved.sample(min(limit, len(approved)), random_state=42)
+    return [
+        {"lat": float(r["latitude"]), "lon": float(r["longitude"])}
+        for _, r in sample.iterrows()
+    ]
+
 
 @app.get("/api/shifts")
-def get_shifts_data():
-    if df_violations.empty:
-        return {}
-    
-    shifts = {
+def get_shifts():
+    """Shift analysis — top hotspots per shift window."""
+    shift_windows = {
         "Morning": (6, 11),
         "Afternoon": (12, 16),
-        "Evening": (17, 21),
-        "Night": (22, 5) # 22:00 to 05:00 next day
+        "Evening": (17, 23),
+        "Night": (0, 5),
     }
-    
-    results = {}
-    for shift_name, (h_start, h_end) in shifts.items():
-        if shift_name == "Night":
-            shift_df = df_violations[(df_violations["hour"] >= h_start) | (df_violations["hour"] <= h_end)]
-        else:
-            shift_df = df_violations[df_violations["hour"].between(h_start, h_end)]
-            
-        if shift_df.empty:
-            results[shift_name] = {"total": 0, "top_violation": "None", "top_hotspots": [], "has_gap_zone": False}
-            continue
-            
-        total_violations = len(shift_df)
-        top_violation = str(shift_df["primary_violation"].mode().iloc[0]) if not shift_df["primary_violation"].mode().empty else "Unknown"
-        
-        # Get top hotspots in this shift
+    result = {}
+    for shift_name, (h_start, h_end) in shift_windows.items():
+        shift_df = _df[_df["hour"].between(h_start, h_end)]
         shift_clustered = shift_df[shift_df["cluster"] != -1]
+        top_violation = (
+            shift_df["primary_violation"].mode().iloc[0]
+            if not shift_df.empty and not shift_df["primary_violation"].mode().empty
+            else "Unknown"
+        )
+        shift_counts = (
+            shift_clustered.groupby("cluster").size()
+            .reset_index(name="count")
+            .sort_values("count", ascending=False)
+            .head(5)
+        ) if not shift_clustered.empty else pd.DataFrame(columns=["cluster", "count"])
+
         top_hotspots = []
-        has_gap_zone = False
-        
-        if not shift_clustered.empty and not df_clusters.empty:
-            shift_counts = shift_clustered.groupby("cluster").size().reset_index(name="count")
-            shift_counts = shift_counts.sort_values("count", ascending=False).head(3)
-            
-            for _, sc in shift_counts.iterrows():
-                cid = int(sc["cluster"])
-                cnt = int(sc["count"])
-                match = df_clusters[df_clusters["cluster_id"] == cid]
-                if not match.empty:
-                    info = match.iloc[0]
-                    is_gap = bool(info["enforcement_gap_flag"])
-                    if is_gap:
-                        has_gap_zone = True
-                    top_hotspots.append({
-                        "cluster_id": cid,
-                        "lat": float(info["lat"]),
-                        "lon": float(info["lon"]),
-                        "count": cnt,
-                        "primary_offence": str(info["top_violation"]),
-                        "police_station": str(info["top_police_station"]),
-                        "is_gap": is_gap
-                    })
-                    
-        results[shift_name] = {
-            "total": total_violations,
+        for _, sc in shift_counts.iterrows():
+            cid = sc["cluster"]
+            match = _cluster_stats[_cluster_stats["cluster_id"] == cid]
+            if match.empty:
+                continue
+            info = match.iloc[0]
+            top_hotspots.append({
+                "cluster_id": int(cid),
+                "count": int(sc["count"]),
+                "police_station": str(info["top_police_station"]),
+                "impact": str(info.get("impact_category", "MODERATE")),
+                "is_gap": bool(info["enforcement_gap_flag"]),
+            })
+
+        result[shift_name] = {
+            "hours": f"{h_start:02d}:00–{h_end:02d}:59",
+            "total": int(len(shift_df)),
             "top_violation": top_violation,
+            "has_gap_zone": any(h["is_gap"] for h in top_hotspots),
             "top_hotspots": top_hotspots,
-            "has_gap_zone": has_gap_zone,
-            "hours": f"{h_start:02d}:00–{h_end:02d}:00"
         }
-    return results
+    return result
+
 
 @app.get("/api/stations")
 def get_stations():
-    if df_violations.empty:
-        return []
-    stations = df_violations["police_station"].dropna().unique().tolist()
-    return sorted(stations)
+    """List of all police stations."""
+    return sorted(_df["police_station"].dropna().unique().tolist())
+
 
 @app.get("/api/station/{station_name}")
-def get_station_data(station_name: str):
-    if df_violations.empty:
-        raise HTTPException(status_code=404, detail="Data empty")
-        
-    sdf = df_violations[df_violations["police_station"].str.lower() == station_name.lower()]
+def get_station(station_name: str):
+    """Detailed breakdown for a single police station."""
+    sdf = _df[_df["police_station"] == station_name]
     if sdf.empty:
-        raise HTTPException(status_code=404, detail=f"No data for station {station_name}")
-        
-    total_cases = len(sdf)
-    approved_cases = int((sdf["validation_status"] == "approved").sum())
-    approval_rate = float(approved_cases / total_cases) if total_cases > 0 else 0
-    
-    avg_resolution = sdf["resolution_hours"].dropna().mean()
-    avg_resolution = float(avg_resolution) if pd.notna(avg_resolution) else None
-    
+        raise HTTPException(status_code=404, detail="Station not found")
+
     # Monthly trend
-    monthly = sdf.groupby("month").size().to_dict()
-    # Fill in months 1-5 if they are missing
-    months_mapped = {str(m): int(monthly.get(m, 0)) for m in range(1, 6)}
-    
-    # Vehicle types
-    vtype = sdf["vehicle_type"].value_counts().to_dict()
-    
-    # Top 3 violations
-    top_v = sdf["primary_violation"].value_counts().head(3).to_dict()
-    top_violations_list = [{"violation": k, "count": int(v)} for k, v in top_v.items()]
-    
-    # Top junctions
-    junction_counts = sdf["junction_name"].value_counts().head(5).to_dict()
-    top_junctions_list = [{"junction": k, "count": int(v)} for k, v in junction_counts.items()]
-    
-    # Enforcement gaps inside this station's jurisdiction
-    station_clusters = df_clusters[df_clusters["top_police_station"].str.lower() == station_name.lower()]
+    monthly_trend = sdf.groupby("month").size().to_dict()
+
+    # Vehicle mix (top 6)
+    vehicle_mix = sdf["vehicle_type"].value_counts().head(6).to_dict()
+
+    # Top violations
+    top_violations = [
+        {"violation": k, "count": int(v)}
+        for k, v in sdf["primary_violation"].value_counts().head(6).items()
+    ]
+
+    # Top junctions (not "No Junction")
+    junc = sdf[sdf["junction_label"] != "No Junction"]
+    top_junctions = [
+        {"junction": k, "count": int(v)}
+        for k, v in junc["junction_label"].value_counts().head(8).items()
+    ]
+
+    # Cluster stats for this station
+    station_clusters = _cluster_stats[_cluster_stats["top_police_station"] == station_name]
     gaps_count = int(station_clusters["enforcement_gap_flag"].sum()) if not station_clusters.empty else 0
-    station_hotspots_count = len(station_clusters)
-    
+
+    total = len(sdf)
+    approved = int((sdf["validation_status"] == "approved").sum())
+    avg_res = float(sdf["resolution_hours"].dropna().mean()) if sdf["resolution_hours"].notna().any() else None
+
+    # Severity breakdown
+    severity_breakdown = sdf["parking_category"].value_counts().to_dict() if "parking_category" in sdf.columns else {}
+
     return {
-        "station_name": station_name,
-        "total_cases": total_cases,
-        "approved_cases": approved_cases,
-        "approval_rate": approval_rate,
-        "avg_resolution_hours": avg_resolution,
-        "monthly_trend": months_mapped,
-        "vehicle_mix": vtype,
-        "top_violations": top_violations_list,
-        "top_junctions": top_junctions_list,
+        "total_cases": total,
+        "approved": approved,
+        "approval_rate": round(approved / total, 3) if total > 0 else 0,
+        "avg_resolution_hours": round(avg_res, 1) if avg_res else None,
+        "hotspots_count": len(station_clusters),
         "gaps_count": gaps_count,
-        "hotspots_count": station_hotspots_count
+        "monthly_trend": {str(k): int(v) for k, v in monthly_trend.items()},
+        "vehicle_mix": {k: int(v) for k, v in vehicle_mix.items()},
+        "top_violations": top_violations,
+        "top_junctions": top_junctions,
+        "severity_breakdown": {k: int(v) for k, v in severity_breakdown.items()},
     }
+
+
+@app.get("/api/parking")
+def get_parking():
+    """Parking Intelligence data — severity, location type, sub-type breakdown."""
+    loc_counts = _df.groupby("location_type").size().to_dict()
+
+    # All unique parking sub-types
+    import json as _json
+    sub_type_counts: dict = {}
+    for val in _df["violation_type"].dropna():
+        try:
+            types = _json.loads(val)
+            for t in types:
+                sub_type_counts[t] = sub_type_counts.get(t, 0) + 1
+        except Exception:
+            pass
+
+    severity_counts = _df["parking_category"].value_counts().to_dict()
+
+    top_hotspots = []
+    for _, row in _cluster_stats.head(25).iterrows():
+        top_hotspots.append({
+            "cluster_id": int(row["cluster_id"]),
+            "junction_label": str(row["junction_label"]),
+            "top_police_station": str(row["top_police_station"]),
+            "location_type": str(row["location_type"]),
+            "violation_count": int(row["violation_count"]),
+            "parking_category": str(row["parking_category"]),
+            "impact_category": str(row["impact_category"]),
+            "estimated_delay_minutes": float(row["estimated_delay_minutes"]),
+            "carriageway_blockage_pct": float(row["carriageway_blockage_pct"]),
+            "trend": str(row.get("trend", "→ Stable")),
+        })
+
+    return {
+        "location_counts": {k: int(v) for k, v in loc_counts.items()},
+        "severity_counts": {k: int(v) for k, v in severity_counts.items()},
+        "sub_type_counts": dict(sorted(sub_type_counts.items(), key=lambda x: -x[1])[:20]),
+        "top_hotspots": top_hotspots,
+    }
+
+
+@app.get("/api/congestion")
+def get_congestion():
+    """Congestion Impact — delay KPIs, hourly heatmap, junction risks."""
+    total_delay = float(_cluster_stats["estimated_delay_minutes"].sum()) if not _cluster_stats.empty else 0
+    critical_zones = int((_cluster_stats["impact_category"] == "CRITICAL").sum()) if not _cluster_stats.empty else 0
+    unique_junctions = int(_df["junction_label"].nunique())
+
+    critical_rows = _df[_df["parking_category"] == "CRITICAL"] if "parking_category" in _df.columns else _df
+    peak_hour = int(critical_rows["hour"].mode().iloc[0]) if not critical_rows.empty else 0
+
+    # Hourly heatmap: hour × parking_category counts
+    if "parking_category" in _df.columns:
+        hourly_pivot = (
+            _df[_df["parking_category"] != "OTHER"]
+            .groupby(["hour", "parking_category"])
+            .size()
+            .unstack(fill_value=0)
+        )
+        heatmap_data = []
+        for h in range(24):
+            row = {"hour": h}
+            for cat in ["CRITICAL", "HIGH", "MODERATE"]:
+                row[cat] = int(hourly_pivot.get(cat, pd.Series(dtype=int)).get(h, 0))
+            heatmap_data.append(row)
+    else:
+        heatmap_data = [{"hour": h, "CRITICAL": 0, "HIGH": 0, "MODERATE": 0} for h in range(24)]
+
+    # Junction risk table
+    junc_risk = (
+        _df[_df["junction_label"] != "No Junction"]
+        .groupby(["junction_id", "junction_label", "police_station"])
+        .agg(
+            violation_count=("id", "count"),
+            critical_count=("parking_category", lambda x: int((x == "CRITICAL").sum())),
+        )
+        .reset_index()
+        .sort_values("critical_count", ascending=False)
+        .head(20)
+    )
+    junction_risks = [
+        {
+            "junction_id": str(r["junction_id"]) if r["junction_id"] else "",
+            "junction_label": str(r["junction_label"]),
+            "police_station": str(r["police_station"]),
+            "violation_count": int(r["violation_count"]),
+            "critical_count": int(r["critical_count"]),
+        }
+        for _, r in junc_risk.iterrows()
+    ]
+
+    # Weekly trend
+    overall_trend = _trends.get("overall", pd.DataFrame())
+    weekly_trend = (
+        overall_trend[["year_week", "count", "trend"]].dropna()
+        .rename(columns={"year_week": "week", "count": "violations"})
+        .to_dict(orient="records")
+    ) if not overall_trend.empty else []
+
+    # Vehicle blockage reference
+    vehicle_blockage = [
+        {"vehicle": "HGV/TANKER", "blockage_pct": 45},
+        {"vehicle": "Private Bus", "blockage_pct": 40},
+        {"vehicle": "LGV", "blockage_pct": 28},
+        {"vehicle": "Van/Tempo", "blockage_pct": 22},
+        {"vehicle": "Maxi-Cab", "blockage_pct": 18},
+        {"vehicle": "Car", "blockage_pct": 15},
+        {"vehicle": "Auto", "blockage_pct": 10},
+        {"vehicle": "Scooter/Bike", "blockage_pct": 5},
+    ]
+
+    return {
+        "total_delay_hours": round(total_delay / 60, 1),
+        "critical_zones": critical_zones,
+        "unique_junctions": unique_junctions,
+        "peak_impact_hour": peak_hour,
+        "heatmap_data": heatmap_data,
+        "junction_risks": junction_risks,
+        "weekly_trend": weekly_trend,
+        "vehicle_blockage": vehicle_blockage,
+    }
+
+
+@app.get("/api/patrol")
+def get_patrol():
+    """Patrol schedule data."""
+    if _patrol_schedule.empty:
+        return {"summary": {}, "schedule": []}
+
+    summary = schedule_summary(_patrol_schedule)
+    schedule = _patrol_schedule.to_dict(orient="records")
+    # Clean NaN
+    schedule = [{k: _clean(v) for k, v in row.items()} for row in schedule]
+    return {"summary": summary, "schedule": schedule}
+
 
 @app.get("/api/mapmyindia/html", response_class=HTMLResponse)
 def get_mapmyindia_html():
+    """Serve the MapmyIndia map HTML with injected data."""
     api_key = os.getenv("MAPMYINDIA_API_KEY", "")
-    if not api_key:
-        return "<h3>MapmyIndia API Key not configured in .env file.</h3>"
-        
-    template_path = os.path.join("components", "mapmyindia_map.html")
-    if not os.path.exists(template_path):
-        return "<h3>MapmyIndia map template not found.</h3>"
-        
-    with open(template_path, "r", encoding="utf-8") as f:
-        html = f.read()
-        
-    # Get hotspot data
-    if df_clusters.empty:
-        hotspot_json = []
-    else:
-        top20 = df_clusters.head(20)
-        hotspot_json = top20[
-            ["cluster_id", "lat", "lon", "congestion_score",
-             "violation_count", "top_violation", "top_police_station"]
-        ].to_dict(orient="records")
-        
-    html = html.replace("{API_KEY}", api_key)
-    html = html.replace("__HOTSPOT_DATA__", json.dumps(hotspot_json))
-    return html
+    if not api_key or api_key == "your_key_here":
+        return HTMLResponse("<h3 style='color:#c0392b;font-family:sans-serif;padding:2rem'>MapmyIndia API key not configured. Add MAPMYINDIA_API_KEY to .env</h3>")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("api:app", host="127.0.0.1", port=8000, reload=True)
+    top30 = _cluster_stats.head(30)[[
+        "cluster_id", "lat", "lon", "congestion_score",
+        "violation_count", "top_violation", "top_police_station",
+        "impact_category", "parking_category", "estimated_delay_minutes",
+        "carriageway_blockage_pct", "location_type", "junction_label", "trend"
+    ]].to_dict(orient="records")
+    # Clean NaN
+    top30 = [{k: _clean(v) for k, v in row.items()} for row in top30]
+
+    template_path = Path("components/mapmyindia_map.html")
+    html = template_path.read_text(encoding="utf-8")
+    html = html.replace("{API_KEY}", api_key)
+    html = html.replace("__HOTSPOT_DATA__", json.dumps(top30))
+    return HTMLResponse(html)
+
+
+# Serve built React frontend static assets from root
+from fastapi.staticfiles import StaticFiles
+if os.path.exists("frontend/dist"):
+    app.mount("/", StaticFiles(directory="frontend/dist", html=True), name="static")
+

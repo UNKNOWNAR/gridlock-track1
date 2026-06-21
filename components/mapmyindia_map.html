@@ -5,8 +5,16 @@
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <style>
 html,body,#map{width:100%;height:100%;margin:0;padding:0}
-.info-popup{font-family:Arial,sans-serif;font-size:12px;line-height:1.5}
-.info-popup b{color:#c0392b}
+.info-popup{font-family:Arial,sans-serif;font-size:12px;line-height:1.8;min-width:200px}
+.info-popup .zone-title{font-size:14px;font-weight:bold;margin-bottom:4px}
+.info-popup .badge{display:inline-block;padding:2px 8px;border-radius:10px;
+  color:#fff;font-size:11px;font-weight:bold;margin-bottom:6px}
+.badge-CRITICAL{background:#c0392b}
+.badge-HIGH{background:#e67e22}
+.badge-MODERATE{background:#f39c12}
+.badge-LOW{background:#27ae60}
+.info-popup .row{display:flex;justify-content:space-between;gap:8px}
+.info-popup .label{color:#7f8c8d}
 </style>
 <script src="https://sdk.mappls.com/map/sdk/web?v=3.0&access_token={API_KEY}&callback=initMap" defer async></script>
 </head>
@@ -16,49 +24,86 @@ html,body,#map{width:100%;height:100%;margin:0;padding:0}
 var HOTSPOT_DATA = __HOTSPOT_DATA__;
 var map;
 
+var IMPACT_COLORS = {
+  "CRITICAL": "#c0392b",
+  "HIGH": "#e67e22",
+  "MODERATE": "#f39c12",
+  "LOW": "#27ae60"
+};
+
+function makeSvgIcon(color) {
+  var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="36" viewBox="0 0 28 36">'
+    + '<ellipse cx="14" cy="34" rx="6" ry="2" fill="rgba(0,0,0,0.2)"/>'
+    + '<path d="M14 0C8.48 0 4 4.48 4 10c0 7.5 10 22 10 22S24 17.5 24 10C24 4.48 19.52 0 14 0z" fill="' + color + '" stroke="#fff" stroke-width="1.5"/>'
+    + '<circle cx="14" cy="10" r="5" fill="#fff" opacity="0.85"/>'
+    + '</svg>';
+  return 'data:image/svg+xml;base64,' + btoa(svg);
+}
+
 function initMap() {
-    map = new mappls.Map('map', {
-        center: { lat: 12.9716, lng: 77.5946 },
-        zoom: 12
+  map = new mappls.Map('map', {
+    center: { lat: 12.9716, lng: 77.5946 },
+    zoom: 12
+  });
+
+  map.addListener('load', function() {
+    // 1. Heatmap layer (all zones)
+    var heatData = HOTSPOT_DATA.map(function(h) {
+      return { lat: h.lat, lng: h.lon };
     });
+    if (heatData.length > 0) {
+      new mappls.HeatmapLayer({
+        map: map,
+        data: heatData,
+        opacity: 0.65,
+        radius: 22,
+        maxIntensity: 12
+      });
+    }
 
-    map.addListener('load', function() {
-        // 1. Prepare and Add Heatmap Layer
-        var heatData = HOTSPOT_DATA.map(function(h) {
-            return { lat: h.lat, lng: h.lon };
-        });
+    // 2. Severity-colored markers
+    HOTSPOT_DATA.forEach(function(h) {
+      var impact = h.impact_category || "MODERATE";
+      var color = IMPACT_COLORS[impact] || "#e67e22";
+      var iconUrl = makeSvgIcon(color);
 
-        if (heatData.length > 0) {
-            new mappls.HeatmapLayer({
-                map: map,
-                data: heatData,
-                opacity: 0.8,
-                radius: 20,
-                maxIntensity: 15
-            });
-        }
+      var delay = parseFloat(h.estimated_delay_minutes || 0);
+      var delayStr = delay >= 60
+        ? (delay / 60).toFixed(1) + ' hrs'
+        : delay.toFixed(0) + ' min';
 
-        // 2. Add Top 10 Markers
-        var top10 = HOTSPOT_DATA.slice(0, 10);
-        top10.forEach(function(h) {
-            var popupContent = '<div class="info-popup">'
-                + '<b>Zone ' + h.cluster_id + '</b><br>'
-                + 'Primary Offence: ' + h.top_violation + '<br>'
-                + 'Cases: ' + h.violation_count + '<br>'
-                + 'Risk Score: ' + h.congestion_score.toFixed(1) + '<br>'
-                + 'Station: ' + h.top_police_station
-                + '</div>';
+      var locType = (h.location_type || "unknown").replace(/_/g, " ");
+      locType = locType.charAt(0).toUpperCase() + locType.slice(1);
 
-            new mappls.Marker({
-                map: map,
-                position: { lat: h.lat, lng: h.lon },
-                popupHtml: popupContent,
-                popupOptions: {
-                    autoClose: true
-                }
-            });
-        });
+      var junctionStr = (h.junction_label && h.junction_label !== "No Junction")
+        ? h.junction_label
+        : ('Zone ' + h.cluster_id + ' Area');
+
+      var popupHtml = '<div class="info-popup">'
+        + '<div class="zone-title">Zone ' + h.cluster_id + ' — ' + junctionStr + '</div>'
+        + '<span class="badge badge-' + impact + '">' + impact + '</span>'
+        + '<div class="row"><span class="label">Parking Severity:</span><span>' + (h.parking_category || '—') + '</span></div>'
+        + '<div class="row"><span class="label">Violations:</span><span>' + h.violation_count + '</span></div>'
+        + '<div class="row"><span class="label">Est. Delay:</span><span>' + delayStr + '</span></div>'
+        + '<div class="row"><span class="label">Road Blockage:</span><span>' + (h.carriageway_blockage_pct || 0).toFixed(1) + '%</span></div>'
+        + '<div class="row"><span class="label">Location Type:</span><span>' + locType + '</span></div>'
+        + '<div class="row"><span class="label">Station:</span><span>' + (h.top_police_station || '—') + '</span></div>'
+        + '<div class="row"><span class="label">Trend:</span><span>' + (h.trend || '→ Stable') + '</span></div>'
+        + '</div>';
+
+      new mappls.Marker({
+        map: map,
+        position: { lat: h.lat, lng: h.lon },
+        icon: {
+          url: iconUrl,
+          width: 28,
+          height: 36,
+        },
+        popupHtml: popupHtml,
+        popupOptions: { autoClose: true }
+      });
     });
+  });
 }
 </script>
 </body>
